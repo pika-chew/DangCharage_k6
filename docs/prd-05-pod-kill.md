@@ -31,10 +31,20 @@
 
 한 Pod가 죽는 동안 다른 Pod가 요청을 받아야 진행 중인 트랜잭션이 많이 생긴다.
 
+Producer(`command-api`)는 Deployment가 아니라 Argo Rollouts의 `Rollout`이다.
+
 ```bash
-kubectl get deploy -n <ns>                          # Producer Deployment 이름 확인
-kubectl get pods -n <ns> --show-labels              # Producer Pod 라벨 확인 (SELECTOR에 쓴다)
-kubectl scale deploy/<producer> -n <ns> --replicas=2
+kubectl get rollout -n dangcharge                   # command-api의 DESIRED/AVAILABLE이 2 이상인지
+kubectl get rollout command-api -n dangcharge -o jsonpath='{.spec.selector.matchLabels}{"\n"}'
+                                                    # Pod 라벨 (SELECTOR에 쓴다)
+# 2개보다 적으면
+kubectl patch rollout command-api -n dangcharge --type merge -p '{"spec":{"replicas":2}}'
+```
+
+`kill-pods.sh`는 `kubectl`이 되는 서버(control-plane 등)에서 실행한다. 파일만 복사해 가도 되고, 결과는 실행한 폴더의 `results/`에 남는다.
+
+```bash
+scp scripts/prd-05-kill-pods.sh ubuntu@<control-plane>:~/
 ```
 
 ### 3. `.env` 설정

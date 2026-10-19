@@ -62,6 +62,15 @@ export const options = {
   thresholds: {
     // Pod 종료로 끊긴 요청이 있어야 테스트가 성립한다
     failed: ['count>0'],
+    // 아래는 판정이 아니라 요약에 실패 내역(요청 종류, 응답 코드)을 나눠 보이려고 둔다
+    'failed{op:create}': ['count>=0'],
+    'failed{op:cancel}': ['count>=0'],
+    'failed{op:me}': ['count>=0'],
+    'failed{status:0}': ['count>=0'],
+    'failed{status:500}': ['count>=0'],
+    'failed{status:502}': ['count>=0'],
+    'failed{status:503}': ['count>=0'],
+    'failed{status:504}': ['count>=0'],
     // 슬롯이 다른 예약과 겹치면 그 VU는 아무것도 쓰지 못한다
     reservation_conflict: ['count==0'],
     unexpected: ['count==0'],
@@ -85,6 +94,11 @@ function dataOf(res, label) {
 /** Pod가 죽어서 생긴 실패: 연결 끊김·타임아웃(status 0)이나 게이트웨이·서버 오류 */
 function isPodFailure(res) {
   return res.status === 0 || res.status >= 500;
+}
+
+/** status 0은 연결 끊김·타임아웃, 그 밖은 게이트웨이·서버가 돌려준 5xx */
+function countFailure(op, res) {
+  failed.add(1, { op, status: String(res.status) });
 }
 
 function errorCode(res) {
@@ -199,7 +213,7 @@ function cancel(token, reservationId) {
   }
   if (isPodFailure(res)) {
     // 예약이 남았으면 다음 반복에서 RESERVATION_ALREADY_ACTIVE로 찾아 취소한다
-    failed.add(1, { op: 'cancel' });
+    countFailure('cancel', res);
   } else {
     unexpected.add(1, { op: 'cancel' });
     console.error(`취소 응답 이상 VU=${__VU} id=${reservationId}: ${res.status} ${res.body}`);
@@ -215,7 +229,7 @@ function cancelLeftover(token) {
     tags: { name: 'GET /api/v1/reservations/me' },
   });
   if (isPodFailure(res)) {
-    failed.add(1, { op: 'me' });
+    countFailure('me', res);
     return;
   }
   const reservationId = res.json('data.reservation.reservationId');
@@ -237,7 +251,7 @@ export default function (data) {
 
   let res = http.post(`${BASE_URL}/api/v1/reservations`, body, params);
   for (let retry = 1; retry <= CREATE_RETRIES && isPodFailure(res); retry++) {
-    failed.add(1, { op: 'create' });
+    countFailure('create', res);
     sleep(1);
     res = http.post(`${BASE_URL}/api/v1/reservations`, body, params);
     if (res.status === 201) {
@@ -258,31 +272,53 @@ export default function (data) {
     console.error(`슬롯 겹침 VU=${__VU} startAt=${startAt}: 다른 예약이 이 슬롯을 쓰고 있습니다`);
     sleep(1);
   } else if (isPodFailure(res)) {
-    failed.add(1, { op: 'create' });
+    countFailure('create', res);
   } else {
     unexpected.add(1, { op: 'create' });
     console.error(`생성 응답 이상 VU=${__VU}: ${res.status} ${res.body}`);
   }
 }
 
-export function teardown(data) {
-  const tags = { phase: 'verify' };
-  const meOf = () => http.batch(data.tokens.map((token) => ({
+const TEARDOWN_WAIT_MS = 120 * 1000;
+
+function meOf(tokens) {
+  return http.batch(tokens.map((token) => ({
     method: 'GET',
     url: `${BASE_URL}/api/v1/reservations/me`,
-    params: { headers: authHeaders(token) },
+    params: { headers: authHeaders(token), timeout: REQUEST_TIMEOUT },
   })));
+}
+
+/** 서버가 Pod 종료에서 복구될 때까지(30명 모두 /me가 200) 기다린다 */
+function waitForServer(tokens) {
+  const until = Date.now() + TEARDOWN_WAIT_MS;
+  let responses = meOf(tokens);
+  while (responses.some((res) => res.status !== 200) && Date.now() < until) {
+    const statuses = [...new Set(responses.map((res) => res.status))].join(',');
+    console.warn(`teardown: 서버 응답 대기 중 (status ${statuses})`);
+    sleep(5);
+    responses = meOf(tokens);
+  }
+  return responses;
+}
+
+export function teardown(data) {
+  const tags = { phase: 'verify' };
 
   // 테스트가 끝날 때 남은 예약을 정리한다. 다음 실행에서 같은 슬롯을 쓸 수 있게 한다
-  meOf().forEach((res, i) => {
+  waitForServer(data.tokens).forEach((res, i) => {
     const reservationId = res.status === 200 ? res.json('data.reservation.reservationId') : null;
     if (reservationId) {
-      http.del(`${BASE_URL}/api/v1/reservations/${reservationId}`, null,
-        { headers: authHeaders(data.tokens[i]) });
+      const del = http.del(`${BASE_URL}/api/v1/reservations/${reservationId}`, null,
+        { headers: authHeaders(data.tokens[i]), timeout: REQUEST_TIMEOUT });
+      console.log(`teardown: 남은 예약 취소 VU=${i + 1} id=${reservationId} → ${del.status}`);
     }
   });
-  const left = meOf().filter((res) => res.status !== 200 || res.json('data.state') !== 'NONE').length;
-  check(left, { '정리 후 진행 중 예약을 가진 사용자 없음': (n) => n === 0 }, tags);
+  const left = meOf(data.tokens)
+    .map((res, i) => ({ vu: i + 1, status: res.status, state: res.status === 200 ? res.json('data.state') : null }))
+    .filter((r) => r.status !== 200 || r.state !== 'NONE');
+  left.forEach((r) => console.error(`teardown: 정리 안 됨 VU=${r.vu} status=${r.status} state=${r.state}`));
+  check(left.length, { '정리 후 진행 중 예약을 가진 사용자 없음': (n) => n === 0 }, tags);
 
   console.log(`PRD-05 끝 run=${data.runId}. 판정 SQL은 아래 SET 한 줄을 먼저 실행한 뒤 scenarios/prd-05-verify.sql을 실행하세요\n`
     + `SET @t0 = '${utcSql(data.startedAt)}';`);

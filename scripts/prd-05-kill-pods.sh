@@ -17,10 +17,10 @@
 #   CONTAINER      Pod에 컨테이너가 여럿이면 대상 컨테이너 이름 (exec-kill)
 #   DEBUG_IMAGE    node-kill 디버그 Pod 이미지 (기본 busybox:1.36)
 #   DEBUG_PROFILE  node-kill 디버그 프로파일 (기본 sysadmin)
+#   MIN_READY      종료 직전 필요한 Ready Pod 수 (기본 2). 모자라면 READY_TIMEOUT초(기본 180)까지 기다린다
 set -euo pipefail
 
-cd "$(dirname "$0")/.."
-
+# 결과는 실행한 폴더의 results/에 남긴다. control-plane 등 다른 서버로 이 파일만 복사해 써도 된다
 MODE=${1:-}
 FIRST_DELAY=${2:-30}
 INTERVAL=${3:-60}
@@ -29,7 +29,7 @@ COUNT=${4:-2}
 case "$MODE" in
   delete | exec-kill | node-kill) ;;
   *)
-    sed -n '2,20p' "$0" >&2
+    sed -n '2,22p' "$0" >&2
     exit 1
     ;;
 esac
@@ -38,6 +38,8 @@ NAMESPACE=${NAMESPACE:-$(kubectl config view --minify -o jsonpath='{..namespace}
 NAMESPACE=${NAMESPACE:-default}
 DEBUG_IMAGE=${DEBUG_IMAGE:-busybox:1.36}
 DEBUG_PROFILE=${DEBUG_PROFILE:-sysadmin}
+MIN_READY=${MIN_READY:-2}
+READY_TIMEOUT=${READY_TIMEOUT:-180}
 
 OUT="results/prd-05-$(date +%Y%m%d-%H%M%S)-$MODE"
 mkdir -p "$OUT"
@@ -120,16 +122,22 @@ k get pods -l "$SELECTOR" -o wide | tee "$OUT/pods-before.txt"
 sleep "$FIRST_DELAY"
 
 for i in $(seq 1 "$COUNT"); do
-  ready=$(ready_pods)
-  ready_count=$(echo "$ready" | grep -c . || true)
+  # 앞에서 죽인 Pod가 다시 Ready가 될 때까지 기다린다. 남은 Pod 하나까지 죽이면 받을 Pod가 없어 전체 장애가 된다
+  waited=0
+  while :; do
+    ready=$(ready_pods)
+    ready_count=$(echo "$ready" | grep -c . || true)
+    if [ "$ready_count" -ge "$MIN_READY" ]; then break; fi
+    if [ "$waited" -ge "$READY_TIMEOUT" ]; then
+      log "Ready Pod가 ${READY_TIMEOUT}초 동안 ${ready_count}개라 [$i/$COUNT] 종료를 건너뜁니다"
+      continue 2
+    fi
+    if [ "$waited" -eq 0 ]; then log "Ready Pod ${ready_count}개, ${MIN_READY}개가 될 때까지 기다립니다"; fi
+    sleep 2
+    waited=$((waited + 2))
+  done
+  if [ "$waited" -gt 0 ]; then log "Ready Pod ${ready_count}개 (${waited}초 기다림)"; fi
   pod=$(pick_pod "$ready")
-  if [ -z "$pod" ]; then
-    log "Ready인 Producer Pod가 없습니다. SELECTOR를 확인하세요"
-    exit 1
-  fi
-  if [ "$ready_count" -lt 2 ]; then
-    log "경고: Ready Pod가 ${ready_count}개입니다. replica 2개 이상이어야 남은 Pod가 요청을 받습니다"
-  fi
   log "[$i/$COUNT] $MODE: $pod (restartCount=$(restarts "$pod"))"
   case "$MODE" in
     delete) kill_delete "$pod" ;;
